@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 import re
+import signal
 import sys
 from typing import Iterable
 
@@ -626,4 +627,5 @@ def hint(ctx: click.Context) -> None:
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
     cli()
