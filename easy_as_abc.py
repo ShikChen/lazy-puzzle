@@ -1,10 +1,9 @@
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
+from functools import lru_cache
 import re
 import signal
-import sys
-from typing import Iterable
+from typing import Iterable, TextIO
 
 import click
 import z3
@@ -62,9 +61,21 @@ class ClueRef:
 
 
 @dataclass(frozen=True)
-class AssumptionSolver:
+class SolverContext:
     solver: z3.Solver
     cells: list[list[z3.IntNumRef]]
+
+
+@dataclass(frozen=True)
+class ClueView:
+    ref: ClueRef
+    symbol: str
+    cells: list[z3.IntNumRef]
+
+
+@dataclass(frozen=True)
+class AssumptionSolver:
+    context: SolverContext
     clue_literals: dict[ClueRef, z3.BoolRef]
     given_literals: dict[CellRef, z3.BoolRef]
 
@@ -167,177 +178,184 @@ def _first_visible_constraint(cells: Iterable[z3.IntNumRef], value: int) -> z3.B
     return z3.Or(clauses)
 
 
-def _build_solver(puzzle: Puzzle) -> tuple[z3.Solver, list[list[z3.IntNumRef]]]:
-    size = puzzle.size
-    letters = puzzle.letters
-    letter_count = len(letters)
-    letter_to_idx = {letter: idx + 1 for idx, letter in enumerate(letters)}
+def _create_cells(size: int) -> list[list[z3.IntNumRef]]:
+    return [[z3.Int(f"cell_{r}_{c}") for c in range(size)] for r in range(size)]
 
-    cells: list[list[z3.IntNumRef]] = [
-        [z3.Int(f"cell_{r}_{c}") for c in range(size)] for r in range(size)
-    ]
-    solver = z3.Solver()
 
-    for r in range(size):
-        for c in range(size):
-            solver.add(cells[r][c] >= 0, cells[r][c] <= letter_count)
+def _add_value_domain_constraints(
+    solver: z3.Solver, cells: list[list[z3.IntNumRef]], max_value: int
+) -> None:
+    for row in cells:
+        for cell in row:
+            solver.add(cell >= 0, cell <= max_value)
 
-    for r in range(size):
+
+def _add_distribution_constraints(
+    solver: z3.Solver, cells: list[list[z3.IntNumRef]], letter_count: int
+) -> None:
+    """Constrain each row/column to contain every letter index exactly once."""
+    size = len(cells)
+    for row in cells:
+        for letter_idx in range(1, letter_count + 1):
+            solver.add(z3.Sum([z3.If(cell == letter_idx, 1, 0) for cell in row]) == 1)
+
+    for col in range(size):
         for letter_idx in range(1, letter_count + 1):
             solver.add(
-                z3.Sum([z3.If(cells[r][c] == letter_idx, 1, 0) for c in range(size)])
-                == 1
-            )
-
-    for c in range(size):
-        for letter_idx in range(1, letter_count + 1):
-            solver.add(
-                z3.Sum([z3.If(cells[r][c] == letter_idx, 1, 0) for r in range(size)])
-                == 1
-            )
-
-    for r in range(size):
-        for c in range(size):
-            token = puzzle.grid[r + 1][c + 1]
-            if token == "x":
-                solver.add(cells[r][c] == 0)
-            elif token != ".":
-                solver.add(cells[r][c] == letter_to_idx[token])
-
-    top = puzzle.grid[0][1 : size + 1]
-    bottom = puzzle.grid[size + 1][1 : size + 1]
-    left = [puzzle.grid[r][0] for r in range(1, size + 1)]
-    right = [puzzle.grid[r][size + 1] for r in range(1, size + 1)]
-
-    for c, clue in enumerate(top):
-        if clue != ".":
-            solver.add(
-                _first_visible_constraint(
-                    [cells[r][c] for r in range(size)], letter_to_idx[clue]
+                z3.Sum(
+                    [
+                        z3.If(cells[row_index][col] == letter_idx, 1, 0)
+                        for row_index in range(size)
+                    ]
                 )
-            )
-    for c, clue in enumerate(bottom):
-        if clue != ".":
-            solver.add(
-                _first_visible_constraint(
-                    [cells[r][c] for r in reversed(range(size))],
-                    letter_to_idx[clue],
-                )
-            )
-    for r, clue in enumerate(left):
-        if clue != ".":
-            solver.add(_first_visible_constraint(cells[r], letter_to_idx[clue]))
-    for r, clue in enumerate(right):
-        if clue != ".":
-            solver.add(
-                _first_visible_constraint(list(reversed(cells[r])), letter_to_idx[clue])
+                == 1
             )
 
-    return solver, cells
 
-
-def _build_solver_with_assumptions(
-    puzzle: Puzzle,
-) -> AssumptionSolver:
-    size = puzzle.size
-    letters = puzzle.letters
-    letter_count = len(letters)
-    letter_to_idx = {letter: idx + 1 for idx, letter in enumerate(letters)}
-
-    cells: list[list[z3.IntNumRef]] = [
-        [z3.Int(f"cell_{r}_{c}") for c in range(size)] for r in range(size)
-    ]
+def _create_solver_context(puzzle: Puzzle, *, unsat_core: bool) -> SolverContext:
+    cells = _create_cells(puzzle.size)
     solver = z3.Solver()
-    solver.set(unsat_core=True)
-    solver.set("core.minimize", True)
+    if unsat_core:
+        solver.set(unsat_core=True)
+        solver.set("core.minimize", True)
+    _add_value_domain_constraints(solver, cells, len(puzzle.letters))
+    _add_distribution_constraints(solver, cells, len(puzzle.letters))
+    return SolverContext(solver=solver, cells=cells)
 
-    for r in range(size):
-        for c in range(size):
-            solver.add(cells[r][c] >= 0, cells[r][c] <= letter_count)
 
-    for r in range(size):
-        for letter_idx in range(1, letter_count + 1):
-            solver.add(
-                z3.Sum([z3.If(cells[r][c] == letter_idx, 1, 0) for c in range(size)])
-                == 1
-            )
+@lru_cache(maxsize=None)
+def _cached_letter_value(symbol: str, first_letter: str) -> int:
+    return ord(symbol) - ord(first_letter) + 1
 
-    for c in range(size):
-        for letter_idx in range(1, letter_count + 1):
-            solver.add(
-                z3.Sum([z3.If(cells[r][c] == letter_idx, 1, 0) for r in range(size)])
-                == 1
-            )
 
-    given_literals: dict[CellRef, z3.BoolRef] = {}
-    for r in range(size):
-        for c in range(size):
-            token = puzzle.grid[r + 1][c + 1]
-            if token == ".":
+def _symbol_to_value(symbol: str, *, first_letter: str) -> int:
+    if symbol == "x":
+        return 0
+    return _cached_letter_value(symbol, first_letter)
+
+
+def _add_fixed_cells_constraints(context: SolverContext, puzzle: Puzzle) -> None:
+    first_letter = puzzle.letters[0]
+    for row in range(puzzle.size):
+        for col in range(puzzle.size):
+            symbol = puzzle.grid[row + 1][col + 1]
+            if symbol == ".":
                 continue
-            lit = z3.Bool(f"given_{r}_{c}")
-            given_literals[CellRef(r, c)] = lit
-            if token == "x":
-                solver.add(z3.Implies(lit, cells[r][c] == 0))
-            else:
-                solver.add(z3.Implies(lit, cells[r][c] == letter_to_idx[token]))
+            context.solver.add(
+                context.cells[row][col]
+                == _symbol_to_value(symbol, first_letter=first_letter)
+            )
 
+
+def _add_fixed_cells_assumptions(
+    context: SolverContext, puzzle: Puzzle
+) -> dict[CellRef, z3.BoolRef]:
+    first_letter = puzzle.letters[0]
+    given_literals: dict[CellRef, z3.BoolRef] = {}
+    for row in range(puzzle.size):
+        for col in range(puzzle.size):
+            symbol = puzzle.grid[row + 1][col + 1]
+            if symbol == ".":
+                continue
+            literal = z3.Bool(f"given_{row}_{col}")
+            given_literals[CellRef(row, col)] = literal
+            context.solver.add(
+                z3.Implies(
+                    literal,
+                    context.cells[row][col]
+                    == _symbol_to_value(symbol, first_letter=first_letter),
+                )
+            )
+    return given_literals
+
+
+def _collect_clue_views(
+    puzzle: Puzzle, cells: list[list[z3.IntNumRef]]
+) -> list[ClueView]:
+    size = puzzle.size
+    clues_by_side: list[tuple[ClueSide, list[str]]] = [
+        (ClueSide.TOP, puzzle.grid[0][1 : size + 1]),
+        (ClueSide.BOTTOM, puzzle.grid[size + 1][1 : size + 1]),
+        (ClueSide.LEFT, [puzzle.grid[row][0] for row in range(1, size + 1)]),
+        (
+            ClueSide.RIGHT,
+            [puzzle.grid[row][size + 1] for row in range(1, size + 1)],
+        ),
+    ]
+
+    def clue_cells(side: ClueSide, index: int) -> list[z3.IntNumRef]:
+        if side == ClueSide.TOP:
+            return [cells[row][index] for row in range(size)]
+        if side == ClueSide.BOTTOM:
+            return [cells[row][index] for row in reversed(range(size))]
+        if side == ClueSide.LEFT:
+            return cells[index]
+        return list(reversed(cells[index]))
+
+    clue_views: list[ClueView] = []
+    for side, symbols in clues_by_side:
+        for index, symbol in enumerate(symbols):
+            if symbol == ".":
+                continue
+            clue_views.append(
+                ClueView(
+                    ref=ClueRef(side, index),
+                    symbol=symbol,
+                    cells=clue_cells(side, index),
+                )
+            )
+
+    return clue_views
+
+
+def _add_clue_constraints(context: SolverContext, puzzle: Puzzle) -> None:
+    first_letter = puzzle.letters[0]
+    for clue in _collect_clue_views(puzzle, context.cells):
+        context.solver.add(
+            _first_visible_constraint(
+                clue.cells,
+                _symbol_to_value(clue.symbol, first_letter=first_letter),
+            )
+        )
+
+
+def _clue_literal_name(clue_ref: ClueRef) -> str:
+    return f"clue_{clue_ref.side.value}_{clue_ref.index}"
+
+
+def _add_clue_assumptions(
+    context: SolverContext, puzzle: Puzzle
+) -> dict[ClueRef, z3.BoolRef]:
+    first_letter = puzzle.letters[0]
     clue_literals: dict[ClueRef, z3.BoolRef] = {}
-    top = puzzle.grid[0][1 : size + 1]
-    bottom = puzzle.grid[size + 1][1 : size + 1]
-    left = [puzzle.grid[r][0] for r in range(1, size + 1)]
-    right = [puzzle.grid[r][size + 1] for r in range(1, size + 1)]
+    for clue in _collect_clue_views(puzzle, context.cells):
+        literal = z3.Bool(_clue_literal_name(clue.ref))
+        clue_literals[clue.ref] = literal
+        context.solver.add(
+            z3.Implies(
+                literal,
+                _first_visible_constraint(
+                    clue.cells,
+                    _symbol_to_value(clue.symbol, first_letter=first_letter),
+                ),
+            )
+        )
+    return clue_literals
 
-    for c, clue in enumerate(top):
-        if clue != ".":
-            lit = z3.Bool(f"clue_top_{c}")
-            clue_literals[ClueRef(ClueSide.TOP, c)] = lit
-            solver.add(
-                z3.Implies(
-                    lit,
-                    _first_visible_constraint(
-                        [cells[r][c] for r in range(size)], letter_to_idx[clue]
-                    ),
-                )
-            )
-    for c, clue in enumerate(bottom):
-        if clue != ".":
-            lit = z3.Bool(f"clue_bottom_{c}")
-            clue_literals[ClueRef(ClueSide.BOTTOM, c)] = lit
-            solver.add(
-                z3.Implies(
-                    lit,
-                    _first_visible_constraint(
-                        [cells[r][c] for r in reversed(range(size))],
-                        letter_to_idx[clue],
-                    ),
-                )
-            )
-    for r, clue in enumerate(left):
-        if clue != ".":
-            lit = z3.Bool(f"clue_left_{r}")
-            clue_literals[ClueRef(ClueSide.LEFT, r)] = lit
-            solver.add(
-                z3.Implies(
-                    lit, _first_visible_constraint(cells[r], letter_to_idx[clue])
-                )
-            )
-    for r, clue in enumerate(right):
-        if clue != ".":
-            lit = z3.Bool(f"clue_right_{r}")
-            clue_literals[ClueRef(ClueSide.RIGHT, r)] = lit
-            solver.add(
-                z3.Implies(
-                    lit,
-                    _first_visible_constraint(
-                        list(reversed(cells[r])), letter_to_idx[clue]
-                    ),
-                )
-            )
 
+def _build_solver(puzzle: Puzzle) -> SolverContext:
+    context = _create_solver_context(puzzle, unsat_core=False)
+    _add_fixed_cells_constraints(context, puzzle)
+    _add_clue_constraints(context, puzzle)
+    return context
+
+
+def _build_solver_with_assumptions(puzzle: Puzzle) -> AssumptionSolver:
+    context = _create_solver_context(puzzle, unsat_core=True)
+    given_literals = _add_fixed_cells_assumptions(context, puzzle)
+    clue_literals = _add_clue_assumptions(context, puzzle)
     return AssumptionSolver(
-        solver=solver,
-        cells=cells,
+        context=context,
         clue_literals=clue_literals,
         given_literals=given_literals,
     )
@@ -360,25 +378,27 @@ def _solution_grid(
 
 
 def solve_puzzle(puzzle: Puzzle, check_unique: bool = True) -> SolveResult:
-    solver, cells = _build_solver(puzzle)
-    if solver.check() != z3.sat:
+    context = _build_solver(puzzle)
+    if context.solver.check() != z3.sat:
         return SolveResult(status=SolveStatus.UNSAT, grid=None)
 
-    model = solver.model()
-    solution = _solution_grid(puzzle, cells, model)
+    model = context.solver.model()
+    solution = _solution_grid(puzzle, context.cells, model)
     status = SolveStatus.SAT
 
     if check_unique:
         differences: list[z3.BoolRef] = []
-        for row in cells:
+        for row in context.cells:
             for cell in row:
                 differences.append(cell != model.evaluate(cell, model_completion=True))
-        solver.push()
-        solver.add(z3.Or(differences))
+        context.solver.push()
+        context.solver.add(z3.Or(differences))
         status = (
-            SolveStatus.MULTIPLE if solver.check() == z3.sat else SolveStatus.UNIQUE
+            SolveStatus.MULTIPLE
+            if context.solver.check() == z3.sat
+            else SolveStatus.UNIQUE
         )
-        solver.pop()
+        context.solver.pop()
 
     return SolveResult(status=status, grid=solution)
 
@@ -468,56 +488,65 @@ def format_solution(
     return "\n".join(lines).rstrip()
 
 
-def _read_puzzle_text(file_path: Path | None, force_stdin: bool) -> str:
-    if file_path and force_stdin:
-        raise click.ClickException("Use either --file or --stdin, not both.")
-
-    if file_path:
-        text = file_path.read_text()
-    else:
-        if force_stdin or not sys.stdin.isatty():
-            text = sys.stdin.read()
-        else:
-            text = ""
-
+def _read_puzzle_text(file_obj: TextIO) -> str:
+    if file_obj.isatty():
+        return SAMPLE_PUZZLE
+    text = file_obj.read()
     if not text.strip():
         text = SAMPLE_PUZZLE
 
     return text
 
 
-def _hint_value_symbol(puzzle: Puzzle, value: int) -> str:
-    if value == 0:
-        return "x"
-    return puzzle.letters[value - 1]
+def _parse_or_click_error(text: str) -> Puzzle:
+    try:
+        return parse_ascii(text)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
-def _find_best_hint(puzzle: Puzzle) -> HintResult | None:
-    solve_result = solve_puzzle(puzzle, check_unique=True)
+def _is_better_hint(candidate: HintResult, current: HintResult | None) -> bool:
+    if current is None:
+        return True
+    if candidate.score != current.score:
+        return candidate.score < current.score
+    if candidate.row != current.row:
+        return candidate.row < current.row
+    return candidate.col < current.col
+
+
+def _find_best_hint(
+    puzzle: Puzzle, solve_result: SolveResult | None = None
+) -> HintResult | None:
+    if solve_result is None:
+        solve_result = solve_puzzle(puzzle, check_unique=True)
     if solve_result.status != SolveStatus.UNIQUE or solve_result.grid is None:
         return None
 
     model_grid = solve_result.grid
-    size = puzzle.size
+    bundle = _build_solver_with_assumptions(puzzle)
+    assumptions = [*bundle.clue_literals.values(), *bundle.given_literals.values()]
+    solver = bundle.context.solver
+    cells = bundle.context.cells
     best: HintResult | None = None
 
-    for r in range(size):
-        for c in range(size):
-            if puzzle.grid[r + 1][c + 1] != ".":
+    for row in range(puzzle.size):
+        for col in range(puzzle.size):
+            if puzzle.grid[row + 1][col + 1] != ".":
                 continue
-            bundle = _build_solver_with_assumptions(puzzle)
-            forced_value = model_grid[r + 1][c + 1]
-            forced_symbol = forced_value
-            forced_int = (
-                0 if forced_value == "x" else puzzle.letters.index(forced_value) + 1
+            forced_symbol = model_grid[row + 1][col + 1]
+            forced_value = _symbol_to_value(
+                forced_symbol, first_letter=puzzle.letters[0]
             )
-            bundle.solver.add(bundle.cells[r][c] != forced_int)
-            assumptions = list(bundle.clue_literals.values()) + list(
-                bundle.given_literals.values()
-            )
-            if bundle.solver.check(*assumptions) != z3.unsat:
+
+            solver.push()
+            solver.add(cells[row][col] != forced_value)
+            is_unsat = solver.check(*assumptions) == z3.unsat
+            core_set = set(solver.unsat_core()) if is_unsat else set()
+            solver.pop()
+            if not is_unsat:
                 continue
-            core_set = set(bundle.solver.unsat_core())
+
             core_clues = {
                 key for key, lit in bundle.clue_literals.items() if lit in core_set
             }
@@ -526,18 +555,14 @@ def _find_best_hint(puzzle: Puzzle) -> HintResult | None:
             }
             score = len(core_set)
             candidate = HintResult(
-                row=r,
-                col=c,
+                row=row,
+                col=col,
                 value=forced_symbol,
                 score=score,
                 core_clues=core_clues,
                 core_givens=core_givens,
             )
-            if (
-                best is None
-                or score < best.score
-                or (score == best.score and (r, c) < (best.row, best.col))
-            ):
+            if _is_better_hint(candidate, best):
                 best = candidate
 
     return best
@@ -545,23 +570,24 @@ def _find_best_hint(puzzle: Puzzle) -> HintResult | None:
 
 @click.group()
 @click.option(
-    "--file", "file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path)
+    "--file",
+    "file_obj",
+    type=click.File("r"),
+    default="-",
+    show_default="stdin",
+    help="Read puzzle from file path (defaults to stdin).",
 )
-@click.option("--stdin", "force_stdin", is_flag=True, help="Read puzzle from stdin.")
 @click.pass_context
-def cli(ctx: click.Context, file_path: Path | None, force_stdin: bool) -> None:
+def cli(ctx: click.Context, file_obj: TextIO) -> None:
     ctx.ensure_object(dict)
-    ctx.obj["text"] = _read_puzzle_text(file_path, force_stdin)
+    ctx.obj["text"] = _read_puzzle_text(file_obj)
 
 
 @cli.command()
 @click.pass_context
 def solve(ctx: click.Context) -> None:
     text = ctx.obj["text"]
-    try:
-        puzzle = parse_ascii(text)
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    puzzle = _parse_or_click_error(text)
 
     result = solve_puzzle(puzzle, check_unique=True)
     if result.status == SolveStatus.UNSAT or result.grid is None:
@@ -576,10 +602,7 @@ def solve(ctx: click.Context) -> None:
 @click.pass_context
 def hint(ctx: click.Context) -> None:
     text = ctx.obj["text"]
-    try:
-        puzzle = parse_ascii(text)
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    puzzle = _parse_or_click_error(text)
 
     solve_result = solve_puzzle(puzzle, check_unique=True)
     if solve_result.status != SolveStatus.UNIQUE or solve_result.grid is None:
@@ -588,7 +611,7 @@ def hint(ctx: click.Context) -> None:
             click.echo("NO HINT")
         return
 
-    hint_result = _find_best_hint(puzzle)
+    hint_result = _find_best_hint(puzzle, solve_result=solve_result)
     if hint_result is None:
         click.echo("NO HINT")
         return
