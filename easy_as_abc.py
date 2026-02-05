@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -8,6 +6,13 @@ from typing import Iterable
 
 import click
 import z3
+
+# Easy as ABC (Classic) rules:
+# - Fill an NxN grid with letters from the given range (e.g., A-C).
+# - Each row and each column contains each letter exactly once.
+# - All other cells are empty (output as `x`).
+# - Edge clues indicate the first visible letter from that side.
+# - Given letters and `x` cells are fixed.
 
 SAMPLE_PUZZLE = """\
 5 A-C
@@ -79,17 +84,17 @@ def parse_ascii(text: str) -> Puzzle:
             raise ValueError(
                 f"Grid line {row_index + 1} must be length {expected_lines}."
             )
-        row: list[str] = []
+        row_cells: list[str] = []
         for ch in line:
             if ch == ".":
-                row.append(ch)
+                row_cells.append(ch)
             elif ch in ("x", "X"):
-                row.append("x")
+                row_cells.append("x")
             elif ch.upper() in letters:
-                row.append(ch.upper())
+                row_cells.append(ch.upper())
             else:
                 raise ValueError(f"Invalid character '{ch}' in grid.")
-        grid.append(row)
+        grid.append(row_cells)
 
     corners = [
         grid[0][0],
@@ -103,8 +108,8 @@ def parse_ascii(text: str) -> Puzzle:
     for col in range(1, size + 1):
         if grid[0][col] == "x" or grid[size + 1][col] == "x":
             raise ValueError("Top/bottom clues must be letters or '.'.")
-    for row in range(1, size + 1):
-        if grid[row][0] == "x" or grid[row][size + 1] == "x":
+    for row_idx in range(1, size + 1):
+        if grid[row_idx][0] == "x" or grid[row_idx][size + 1] == "x":
             raise ValueError("Left/right clues must be letters or '.'.")
 
     return Puzzle(size=size, range_text=range_text, letters=letters, grid=grid)
@@ -263,7 +268,7 @@ def cli(file_path: Path | None, force_stdin: bool) -> None:
         raise click.ClickException(str(exc)) from exc
 
     result = solve_puzzle(puzzle, check_unique=True)
-    if result.status == "UNSAT":
+    if result.status == "UNSAT" or result.grid is None:
         click.echo("UNSAT")
         return
 
