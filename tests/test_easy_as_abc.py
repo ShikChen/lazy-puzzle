@@ -78,6 +78,19 @@ class EasyAsABCTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Range start must be <= range end."):
             parse_ascii("2 B-A")
 
+    def test_parse_rejects_range_not_starting_at_a(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Range must start at A."):
+            parse_ascii(
+                """\
+3 B-D
+.....
+.....
+.....
+.....
+.....
+"""
+            )
+
     def test_parse_rejects_non_dot_corner(self) -> None:
         with self.assertRaisesRegex(ValueError, "Corner cells must be"):
             parse_ascii(

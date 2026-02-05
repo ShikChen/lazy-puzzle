@@ -122,6 +122,8 @@ def parse_ascii(text: str) -> Puzzle:
         raise ValueError("Grid size must be positive.")
 
     letters = _parse_range(parts[1])
+    if letters[0] != "A":
+        raise ValueError("Range must start at A.")
     if len(letters) > size:
         raise ValueError("Range length cannot exceed grid size.")
     expected_lines = size + 2
@@ -224,33 +226,24 @@ def _create_solver_context(puzzle: Puzzle, *, unsat_core: bool) -> SolverContext
 
 
 @lru_cache(maxsize=None)
-def _cached_letter_value(symbol: str, first_letter: str) -> int:
-    return ord(symbol) - ord(first_letter) + 1
-
-
-def _symbol_to_value(symbol: str, *, first_letter: str) -> int:
+def _symbol_to_value(symbol: str) -> int:
     if symbol == "x":
         return 0
-    return _cached_letter_value(symbol, first_letter)
+    return ord(symbol) - ord("A") + 1
 
 
 def _add_fixed_cells_constraints(context: SolverContext, puzzle: Puzzle) -> None:
-    first_letter = puzzle.letters[0]
     for row in range(puzzle.size):
         for col in range(puzzle.size):
             symbol = puzzle.grid[row + 1][col + 1]
             if symbol == ".":
                 continue
-            context.solver.add(
-                context.cells[row][col]
-                == _symbol_to_value(symbol, first_letter=first_letter)
-            )
+            context.solver.add(context.cells[row][col] == _symbol_to_value(symbol))
 
 
 def _add_fixed_cells_assumptions(
     context: SolverContext, puzzle: Puzzle
 ) -> dict[CellRef, z3.BoolRef]:
-    first_letter = puzzle.letters[0]
     given_literals: dict[CellRef, z3.BoolRef] = {}
     for row in range(puzzle.size):
         for col in range(puzzle.size):
@@ -262,8 +255,7 @@ def _add_fixed_cells_assumptions(
             context.solver.add(
                 z3.Implies(
                     literal,
-                    context.cells[row][col]
-                    == _symbol_to_value(symbol, first_letter=first_letter),
+                    context.cells[row][col] == _symbol_to_value(symbol),
                 )
             )
     return given_literals
@@ -273,27 +265,30 @@ def _collect_clue_views(
     puzzle: Puzzle, cells: list[list[z3.IntNumRef]]
 ) -> list[ClueView]:
     size = puzzle.size
-    clues_by_side: list[tuple[ClueSide, list[str]]] = [
-        (ClueSide.TOP, puzzle.grid[0][1 : size + 1]),
-        (ClueSide.BOTTOM, puzzle.grid[size + 1][1 : size + 1]),
-        (ClueSide.LEFT, [puzzle.grid[row][0] for row in range(1, size + 1)]),
-        (
-            ClueSide.RIGHT,
-            [puzzle.grid[row][size + 1] for row in range(1, size + 1)],
-        ),
-    ]
+    top = puzzle.grid[0][1 : size + 1]
+    bottom = puzzle.grid[size + 1][1 : size + 1]
+    left = [puzzle.grid[row][0] for row in range(1, size + 1)]
+    right = [puzzle.grid[row][size + 1] for row in range(1, size + 1)]
+    clues_by_side: dict[ClueSide, list[str]] = {
+        ClueSide.TOP: top,
+        ClueSide.BOTTOM: bottom,
+        ClueSide.LEFT: left,
+        ClueSide.RIGHT: right,
+    }
 
     def clue_cells(side: ClueSide, index: int) -> list[z3.IntNumRef]:
-        if side == ClueSide.TOP:
-            return [cells[row][index] for row in range(size)]
-        if side == ClueSide.BOTTOM:
-            return [cells[row][index] for row in reversed(range(size))]
-        if side == ClueSide.LEFT:
-            return cells[index]
-        return list(reversed(cells[index]))
+        match side:
+            case ClueSide.TOP:
+                return [cells[row][index] for row in range(size)]
+            case ClueSide.BOTTOM:
+                return [cells[-1 - row][index] for row in range(size)]
+            case ClueSide.LEFT:
+                return cells[index]
+            case ClueSide.RIGHT:
+                return list(reversed(cells[index]))
 
     clue_views: list[ClueView] = []
-    for side, symbols in clues_by_side:
+    for side, symbols in clues_by_side.items():
         for index, symbol in enumerate(symbols):
             if symbol == ".":
                 continue
@@ -309,12 +304,11 @@ def _collect_clue_views(
 
 
 def _add_clue_constraints(context: SolverContext, puzzle: Puzzle) -> None:
-    first_letter = puzzle.letters[0]
     for clue in _collect_clue_views(puzzle, context.cells):
         context.solver.add(
             _first_visible_constraint(
                 clue.cells,
-                _symbol_to_value(clue.symbol, first_letter=first_letter),
+                _symbol_to_value(clue.symbol),
             )
         )
 
@@ -326,7 +320,6 @@ def _clue_literal_name(clue_ref: ClueRef) -> str:
 def _add_clue_assumptions(
     context: SolverContext, puzzle: Puzzle
 ) -> dict[ClueRef, z3.BoolRef]:
-    first_letter = puzzle.letters[0]
     clue_literals: dict[ClueRef, z3.BoolRef] = {}
     for clue in _collect_clue_views(puzzle, context.cells):
         literal = z3.Bool(_clue_literal_name(clue.ref))
@@ -336,7 +329,7 @@ def _add_clue_assumptions(
                 literal,
                 _first_visible_constraint(
                     clue.cells,
-                    _symbol_to_value(clue.symbol, first_letter=first_letter),
+                    _symbol_to_value(clue.symbol),
                 ),
             )
         )
@@ -508,11 +501,11 @@ def _parse_or_click_error(text: str) -> Puzzle:
 def _is_better_hint(candidate: HintResult, current: HintResult | None) -> bool:
     if current is None:
         return True
-    if candidate.score != current.score:
-        return candidate.score < current.score
-    if candidate.row != current.row:
-        return candidate.row < current.row
-    return candidate.col < current.col
+    return (candidate.score, candidate.row, candidate.col) < (
+        current.score,
+        current.row,
+        current.col,
+    )
 
 
 def _find_best_hint(
@@ -535,9 +528,7 @@ def _find_best_hint(
             if puzzle.grid[row + 1][col + 1] != ".":
                 continue
             forced_symbol = model_grid[row + 1][col + 1]
-            forced_value = _symbol_to_value(
-                forced_symbol, first_letter=puzzle.letters[0]
-            )
+            forced_value = _symbol_to_value(forced_symbol)
 
             solver.push()
             solver.add(cells[row][col] != forced_value)
