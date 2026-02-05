@@ -41,6 +41,33 @@ class SolveStatus(StrEnum):
     UNSAT = "UNSAT"
 
 
+class ClueSide(StrEnum):
+    TOP = "top"
+    BOTTOM = "bottom"
+    LEFT = "left"
+    RIGHT = "right"
+
+
+@dataclass(frozen=True)
+class CellRef:
+    row: int
+    col: int
+
+
+@dataclass(frozen=True)
+class ClueRef:
+    side: ClueSide
+    index: int
+
+
+@dataclass(frozen=True)
+class AssumptionSolver:
+    solver: z3.Solver
+    cells: list[list[z3.IntNumRef]]
+    clue_literals: dict[ClueRef, z3.BoolRef]
+    given_literals: dict[CellRef, z3.BoolRef]
+
+
 @dataclass(frozen=True)
 class SolveResult:
     status: SolveStatus
@@ -53,8 +80,8 @@ class HintResult:
     col: int
     value: str
     score: int
-    core_clues: set[tuple[str, int]]
-    core_givens: set[tuple[int, int]]
+    core_clues: set[ClueRef]
+    core_givens: set[CellRef]
 
 
 def _parse_range(range_text: str) -> list[str]:
@@ -210,12 +237,7 @@ def _build_solver(puzzle: Puzzle) -> tuple[z3.Solver, list[list[z3.IntNumRef]]]:
 
 def _build_solver_with_assumptions(
     puzzle: Puzzle,
-) -> tuple[
-    z3.Solver,
-    list[list[z3.IntNumRef]],
-    dict[tuple[str, int], z3.BoolRef],
-    dict[tuple[int, int], z3.BoolRef],
-]:
+) -> AssumptionSolver:
     size = puzzle.size
     letters = puzzle.letters
     letter_count = len(letters)
@@ -245,20 +267,20 @@ def _build_solver_with_assumptions(
                 == 1
             )
 
-    given_literals: dict[tuple[int, int], z3.BoolRef] = {}
+    given_literals: dict[CellRef, z3.BoolRef] = {}
     for r in range(size):
         for c in range(size):
             token = puzzle.grid[r + 1][c + 1]
             if token == ".":
                 continue
             lit = z3.Bool(f"given_{r}_{c}")
-            given_literals[(r, c)] = lit
+            given_literals[CellRef(r, c)] = lit
             if token == "x":
                 solver.add(z3.Implies(lit, cells[r][c] == 0))
             else:
                 solver.add(z3.Implies(lit, cells[r][c] == letter_to_idx[token]))
 
-    clue_literals: dict[tuple[str, int], z3.BoolRef] = {}
+    clue_literals: dict[ClueRef, z3.BoolRef] = {}
     top = puzzle.grid[0][1 : size + 1]
     bottom = puzzle.grid[size + 1][1 : size + 1]
     left = [puzzle.grid[r][0] for r in range(1, size + 1)]
@@ -267,7 +289,7 @@ def _build_solver_with_assumptions(
     for c, clue in enumerate(top):
         if clue != ".":
             lit = z3.Bool(f"clue_top_{c}")
-            clue_literals[("top", c)] = lit
+            clue_literals[ClueRef(ClueSide.TOP, c)] = lit
             solver.add(
                 z3.Implies(
                     lit,
@@ -279,7 +301,7 @@ def _build_solver_with_assumptions(
     for c, clue in enumerate(bottom):
         if clue != ".":
             lit = z3.Bool(f"clue_bottom_{c}")
-            clue_literals[("bottom", c)] = lit
+            clue_literals[ClueRef(ClueSide.BOTTOM, c)] = lit
             solver.add(
                 z3.Implies(
                     lit,
@@ -292,7 +314,7 @@ def _build_solver_with_assumptions(
     for r, clue in enumerate(left):
         if clue != ".":
             lit = z3.Bool(f"clue_left_{r}")
-            clue_literals[("left", r)] = lit
+            clue_literals[ClueRef(ClueSide.LEFT, r)] = lit
             solver.add(
                 z3.Implies(
                     lit, _first_visible_constraint(cells[r], letter_to_idx[clue])
@@ -301,7 +323,7 @@ def _build_solver_with_assumptions(
     for r, clue in enumerate(right):
         if clue != ".":
             lit = z3.Bool(f"clue_right_{r}")
-            clue_literals[("right", r)] = lit
+            clue_literals[ClueRef(ClueSide.RIGHT, r)] = lit
             solver.add(
                 z3.Implies(
                     lit,
@@ -311,7 +333,12 @@ def _build_solver_with_assumptions(
                 )
             )
 
-    return solver, cells, clue_literals, given_literals
+    return AssumptionSolver(
+        solver=solver,
+        cells=cells,
+        clue_literals=clue_literals,
+        given_literals=given_literals,
+    )
 
 
 def _solution_grid(
@@ -374,9 +401,9 @@ def _format_clue_line(clues: list[str], size: int, highlights: set[int] | None) 
 def format_solution(
     puzzle: Puzzle,
     grid: list[list[str]],
-    highlight_cells: set[tuple[int, int]] | None = None,
-    highlight_clues: set[tuple[str, int]] | None = None,
-    hint_cell: tuple[int, int] | None = None,
+    highlight_cells: set[CellRef] | None = None,
+    highlight_clues: set[ClueRef] | None = None,
+    hint_cell: CellRef | None = None,
 ) -> str:
     size = puzzle.size
     top = puzzle.grid[0][1 : size + 1]
@@ -384,25 +411,28 @@ def format_solution(
     left = [puzzle.grid[r][0] for r in range(1, size + 1)]
     right = [puzzle.grid[r][size + 1] for r in range(1, size + 1)]
 
-    clue_highlights: dict[str, set[int]] = {}
+    clue_highlights: dict[ClueSide, set[int]] = {}
     if highlight_clues:
-        for direction, index in highlight_clues:
-            clue_highlights.setdefault(direction, set()).add(index)
+        for clue in highlight_clues:
+            clue_highlights.setdefault(clue.side, set()).add(clue.index)
 
     border = "+" + "+".join(["---"] * size) + "+"
     lines: list[str] = []
-    lines.append(_format_clue_line(top, size, clue_highlights.get("top")))
+    lines.append(_format_clue_line(top, size, clue_highlights.get(ClueSide.TOP)))
     lines.append(f"{'':>3} {border}")
     for r in range(size):
         left_clue = left[r] if left[r] != "." else ""
         right_clue = right[r] if right[r] != "." else ""
-        left_highlight = highlight_clues is not None and ("left", r) in highlight_clues
+        left_highlight = (
+            highlight_clues is not None and ClueRef(ClueSide.LEFT, r) in highlight_clues
+        )
         right_highlight = (
-            highlight_clues is not None and ("right", r) in highlight_clues
+            highlight_clues is not None
+            and ClueRef(ClueSide.RIGHT, r) in highlight_clues
         )
         row_tokens: list[str] = []
         for c, cell in enumerate(grid[r + 1][1 : size + 1]):
-            coords = (r, c)
+            coords = CellRef(r, c)
             display = cell
             if cell == "." and not (hint_cell and coords == hint_cell):
                 display = " "
@@ -432,7 +462,7 @@ def format_solution(
             line += f" {right_display}"
         lines.append(line.rstrip())
         lines.append(f"{'':>3} {border}")
-    lines.append(_format_clue_line(bottom, size, clue_highlights.get("bottom")))
+    lines.append(_format_clue_line(bottom, size, clue_highlights.get(ClueSide.BOTTOM)))
     return "\n".join(lines).rstrip()
 
 
@@ -489,23 +519,25 @@ def _find_best_hint(puzzle: Puzzle) -> HintResult | None:
         for c in range(size):
             if puzzle.grid[r + 1][c + 1] != ".":
                 continue
-            solver, cells, clue_literals, given_literals = (
-                _build_solver_with_assumptions(puzzle)
-            )
+            bundle = _build_solver_with_assumptions(puzzle)
             forced_value = model_grid[r + 1][c + 1]
             forced_symbol = forced_value
             forced_int = (
                 0 if forced_value == "x" else puzzle.letters.index(forced_value) + 1
             )
-            solver.add(cells[r][c] != forced_int)
-            assumptions = list(clue_literals.values()) + list(given_literals.values())
-            if solver.check(*assumptions) != z3.unsat:
+            bundle.solver.add(bundle.cells[r][c] != forced_int)
+            assumptions = list(bundle.clue_literals.values()) + list(
+                bundle.given_literals.values()
+            )
+            if bundle.solver.check(*assumptions) != z3.unsat:
                 continue
-            core = _minimal_core(solver)
+            core = _minimal_core(bundle.solver)
             core_set = set(core)
-            core_clues = {key for key, lit in clue_literals.items() if lit in core_set}
+            core_clues = {
+                key for key, lit in bundle.clue_literals.items() if lit in core_set
+            }
             core_givens = {
-                key for key, lit in given_literals.items() if lit in core_set
+                key for key, lit in bundle.given_literals.items() if lit in core_set
             }
             score = len(core)
             candidate = HintResult(
@@ -581,7 +613,7 @@ def hint(ctx: click.Context) -> None:
         f"HINT {hint_result.row + 1} {hint_result.col + 1} = {hint_result.value} "
         f"(score: {hint_result.score})"
     )
-    hint_cell = (hint_result.row, hint_result.col)
+    hint_cell = CellRef(hint_result.row, hint_result.col)
     click.echo(
         format_solution(
             puzzle,
