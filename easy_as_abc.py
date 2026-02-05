@@ -249,6 +249,7 @@ def _build_solver_with_assumptions(
     ]
     solver = z3.Solver()
     solver.set(unsat_core=True)
+    solver.set("core.minimize", True)
 
     for r in range(size):
         for c in range(size):
@@ -491,22 +492,6 @@ def _hint_value_symbol(puzzle: Puzzle, value: int) -> str:
     return puzzle.letters[value - 1]
 
 
-def _minimal_core(solver: z3.Solver) -> list[z3.BoolRef]:
-    core = list(solver.unsat_core())
-    core_set = set(core)
-    changed = True
-    while changed:
-        changed = False
-        for lit in list(core_set):
-            trial = [a for a in core_set if a is not lit]
-            if not trial:
-                continue
-            if solver.check(*trial) == z3.unsat:
-                core_set.remove(lit)
-                changed = True
-    return [lit for lit in core if lit in core_set]
-
-
 def _find_best_hint(puzzle: Puzzle) -> HintResult | None:
     solve_result = solve_puzzle(puzzle, check_unique=True)
     if solve_result.status != SolveStatus.UNIQUE or solve_result.grid is None:
@@ -532,15 +517,14 @@ def _find_best_hint(puzzle: Puzzle) -> HintResult | None:
             )
             if bundle.solver.check(*assumptions) != z3.unsat:
                 continue
-            core = _minimal_core(bundle.solver)
-            core_set = set(core)
+            core_set = set(bundle.solver.unsat_core())
             core_clues = {
                 key for key, lit in bundle.clue_literals.items() if lit in core_set
             }
             core_givens = {
                 key for key, lit in bundle.given_literals.items() if lit in core_set
             }
-            score = len(core)
+            score = len(core_set)
             candidate = HintResult(
                 row=r,
                 col=c,
