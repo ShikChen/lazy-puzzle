@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 import re
 import sys
@@ -29,14 +30,20 @@ B......
 @dataclass(frozen=True)
 class Puzzle:
     size: int
-    range_text: str
     letters: list[str]
     grid: list[list[str]]
 
 
+class SolveStatus(StrEnum):
+    SAT = "SAT"
+    UNIQUE = "UNIQUE"
+    MULTIPLE = "MULTIPLE"
+    UNSAT = "UNSAT"
+
+
 @dataclass(frozen=True)
 class SolveResult:
-    status: str
+    status: SolveStatus
     grid: list[list[str]] | None
 
 
@@ -68,8 +75,6 @@ def parse_ascii(text: str) -> Puzzle:
     letters = _parse_range(parts[1])
     if len(letters) > size:
         raise ValueError("Range length cannot exceed grid size.")
-    range_text = f"{letters[0]}-{letters[-1]}"
-
     expected_lines = size + 2
     grid_lines = lines[1:]
     if len(grid_lines) != expected_lines:
@@ -112,7 +117,7 @@ def parse_ascii(text: str) -> Puzzle:
         if grid[row_idx][0] == "x" or grid[row_idx][size + 1] == "x":
             raise ValueError("Left/right clues must be letters or '.'.")
 
-    return Puzzle(size=size, range_text=range_text, letters=letters, grid=grid)
+    return Puzzle(size=size, letters=letters, grid=grid)
 
 
 def _first_visible_constraint(cells: Iterable[z3.IntNumRef], value: int) -> z3.BoolRef:
@@ -212,11 +217,11 @@ def _solution_grid(
 def solve_puzzle(puzzle: Puzzle, check_unique: bool = True) -> SolveResult:
     solver, cells = _build_solver(puzzle)
     if solver.check() != z3.sat:
-        return SolveResult(status="UNSAT", grid=None)
+        return SolveResult(status=SolveStatus.UNSAT, grid=None)
 
     model = solver.model()
     solution = _solution_grid(puzzle, cells, model)
-    status = "SAT"
+    status = SolveStatus.SAT
 
     if check_unique:
         differences: list[z3.BoolRef] = []
@@ -225,7 +230,9 @@ def solve_puzzle(puzzle: Puzzle, check_unique: bool = True) -> SolveResult:
                 differences.append(cell != model.evaluate(cell, model_completion=True))
         solver.push()
         solver.add(z3.Or(differences))
-        status = "MULTIPLE" if solver.check() == z3.sat else "UNIQUE"
+        status = (
+            SolveStatus.MULTIPLE if solver.check() == z3.sat else SolveStatus.UNIQUE
+        )
         solver.pop()
 
     return SolveResult(status=status, grid=solution)
@@ -236,10 +243,38 @@ def solve_text(text: str, check_unique: bool = True) -> SolveResult:
     return solve_puzzle(puzzle, check_unique=check_unique)
 
 
-def format_solution(puzzle: Puzzle, grid: list[list[str]], status: str) -> str:
-    lines = [status, f"{puzzle.size} {puzzle.range_text}"]
-    lines.extend("".join(row) for row in grid)
-    return "\n".join(lines)
+def _format_clue_line(clues: list[str], size: int) -> str:
+    chars = [" "] * (size * 4 + 1)
+    for idx, clue in enumerate(clues):
+        if clue != ".":
+            chars[2 + idx * 4] = clue
+    return (" " * 4 + "".join(chars)).rstrip()
+
+
+def format_solution(puzzle: Puzzle, grid: list[list[str]]) -> str:
+    size = puzzle.size
+    top = puzzle.grid[0][1 : size + 1]
+    bottom = puzzle.grid[size + 1][1 : size + 1]
+    left = [puzzle.grid[r][0] for r in range(1, size + 1)]
+    right = [puzzle.grid[r][size + 1] for r in range(1, size + 1)]
+
+    border = "+" + "+".join(["---"] * size) + "+"
+    lines: list[str] = []
+    lines.append(_format_clue_line(top, size))
+    lines.append(f"{'':>3} {border}")
+    for r in range(size):
+        left_clue = left[r] if left[r] != "." else ""
+        right_clue = right[r] if right[r] != "." else ""
+        row_cells = (
+            "|" + "|".join(f" {cell} " for cell in grid[r + 1][1 : size + 1]) + "|"
+        )
+        line = f"{left_clue:>3} {row_cells}"
+        if right_clue:
+            line += f" {right_clue}"
+        lines.append(line.rstrip())
+        lines.append(f"{'':>3} {border}")
+    lines.append(_format_clue_line(bottom, size))
+    return "\n".join(lines).rstrip()
 
 
 @click.command()
@@ -268,11 +303,12 @@ def cli(file_path: Path | None, force_stdin: bool) -> None:
         raise click.ClickException(str(exc)) from exc
 
     result = solve_puzzle(puzzle, check_unique=True)
-    if result.status == "UNSAT" or result.grid is None:
-        click.echo("UNSAT")
+    if result.status == SolveStatus.UNSAT or result.grid is None:
+        click.echo(SolveStatus.UNSAT.value)
         return
 
-    click.echo(format_solution(puzzle, result.grid, result.status))
+    click.echo(result.status.value)
+    click.echo(format_solution(puzzle, result.grid))
 
 
 if __name__ == "__main__":
