@@ -403,11 +403,14 @@ def format_solution(
         row_tokens: list[str] = []
         for c, cell in enumerate(grid[r + 1][1 : size + 1]):
             coords = (r, c)
-            styled = cell
+            display = cell
+            if cell == "." and not (hint_cell and coords == hint_cell):
+                display = " "
+            styled = display
             if hint_cell and coords == hint_cell:
-                styled = click.style(cell, fg="bright_green")
+                styled = click.style(display, fg="bright_green")
             elif highlight_cells and coords in highlight_cells:
-                styled = click.style(cell, fg="yellow")
+                styled = click.style(display, fg="yellow")
             row_tokens.append(f" {styled} ")
         row_cells = "|" + "|".join(row_tokens) + "|"
         if left_clue:
