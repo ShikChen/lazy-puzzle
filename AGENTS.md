@@ -6,4 +6,5 @@ Guidelines for AI coding agents working in this repository:
 - Add dependencies with `uv add`.
 - Format before committing: `uv run ruff format`.
 - Check with `uv run ruff check` and `uv run ty check`.
+- Use Conventional Commits for commit messages (e.g., `feat: ...`, `fix: ...`).
 - Keep changes focused and update docs/tests when behavior changes.
